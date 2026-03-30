@@ -3,8 +3,6 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
-import { createServer } from 'http';
-import { Server } from 'socket.io';
 import { connectDB } from './config/db.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { apiLimiter } from './middleware/rateLimiter.js';
@@ -20,20 +18,20 @@ import quizRoutes from './routes/quiz.js';
 import analyticsRoutes from './routes/analytics.js';
 import aiRoutes from './routes/ai.js';
 
+// ─── Lazy DB connection (cached across warm invocations) ─────────────────────
+// In serverless, top-level connectDB() would run on every cold start but the
+// connection would be dropped between invocations. We cache it instead.
+let isDBConnected = false;
+const ensureDB = async () => {
+  if (!isDBConnected) {
+    await connectDB();
+    isDBConnected = true;
+  }
+};
+
 const app = express();
-const httpServer = createServer(app);
 
-const io = new Server(httpServer, {
-  cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
-    methods: ['GET', 'POST'],
-    credentials: true,
-  },
-  transports: ['websocket', 'polling'],
-});
-
-connectDB();
-
+// ─── Middleware ──────────────────────────────────────────────────────────────
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({
   origin: process.env.CLIENT_URL || 'http://localhost:5173',
@@ -43,65 +41,23 @@ app.use(cors({
 app.use(morgan('dev'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
-app.use('/api', apiLimiter);
 
-// ─── Socket.IO: Real-time Focus Rooms ───────────────────────────────────────
-const focusRooms = new Map(); // roomId => Map<socketId, participantData>
-
-io.on('connection', (socket) => {
-  console.log('Socket connected:', socket.id);
-
-  socket.on('join-room', ({ roomId, userId, username }) => {
-    socket.join(roomId);
-    if (!focusRooms.has(roomId)) focusRooms.set(roomId, new Map());
-    focusRooms.get(roomId).set(socket.id, {
-      userId, username, status: 'focusing', joinedAt: Date.now(),
-    });
-    io.to(roomId).emit('room-update', {
-      participants: Array.from(focusRooms.get(roomId).values()),
-    });
-    console.log(`${username} joined room ${roomId}`);
-  });
-
-  socket.on('focus-status', ({ roomId, status }) => {
-    const room = focusRooms.get(roomId);
-    if (room && room.has(socket.id)) {
-      room.get(socket.id).status = status;
-      io.to(roomId).emit('room-update', {
-        participants: Array.from(room.values()),
-      });
-    }
-  });
-
-  socket.on('send-message', ({ roomId, message, username }) => {
-    io.to(roomId).emit('new-message', {
-      message: message?.slice(0, 500),
-      username,
-      timestamp: Date.now(),
-    });
-  });
-
-  socket.on('disconnecting', () => {
-    for (const roomId of socket.rooms) {
-      if (roomId === socket.id) continue;
-      const room = focusRooms.get(roomId);
-      if (room) {
-        room.delete(socket.id);
-        if (room.size === 0) {
-          focusRooms.delete(roomId);
-        } else {
-          io.to(roomId).emit('room-update', {
-            participants: Array.from(room.values()),
-          });
-        }
-      }
-    }
-  });
-
-  socket.on('disconnect', () => console.log('Socket disconnected:', socket.id));
+// ─── DB connection middleware (runs before every request) ────────────────────
+// This ensures the DB is connected before any route handler runs,
+// and reuses the existing connection on warm invocations.
+app.use(async (req, res, next) => {
+  try {
+    await ensureDB();
+    next();
+  } catch (err) {
+    console.error('DB connection failed:', err);
+    res.status(503).json({ success: false, message: 'Database unavailable' });
+  }
 });
 
-// ─── API Routes ─────────────────────────────────────────────────────────────
+app.use('/api', apiLimiter);
+
+// ─── API Routes ──────────────────────────────────────────────────────────────
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/bio-rhythm', bioRhythmRoutes);
@@ -113,7 +69,7 @@ app.use('/api/quiz', quizRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/ai', aiRoutes);
 
-app.get('/api/health', (req, res) => {
+app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -129,11 +85,17 @@ app.use((req, res) => {
 
 app.use(errorHandler);
 
-const PORT = parseInt(process.env.PORT) || 5000;
-httpServer.listen(PORT, () => {
-  console.log(`\n🧠 Cognitive Mirror API running on port ${PORT}`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`📡 CORS origin: ${process.env.CLIENT_URL || 'http://localhost:5173'}\n`);
-});
+// ─── Local dev only: start HTTP server when not on Vercel ───────────────────
+// On Vercel, the file is imported as a module and `app` is the default export.
+// Locally, we still want `node server.js` to work normally.
+if (process.env.NODE_ENV !== 'production') {
+  const PORT = parseInt(process.env.PORT) || 5000;
+  app.listen(PORT, () => {
+    console.log(`\n🧠 Cognitive Mirror API running on port ${PORT}`);
+    console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`📡 CORS origin: ${process.env.CLIENT_URL || 'http://localhost:5173'}\n`);
+  });
+}
 
-export { io };
+// ─── Vercel expects a default export of the Express app ─────────────────────
+export default app;
